@@ -1,93 +1,119 @@
-# trip_chatbot_Gwangju_03_hyejinyu_wookyung
+```
+# 광주 여행 RAG 챗봇 서버
 
+FastAPI + LangGraph + LangChain 기반의 RAG(Retrieval-Augmented Generation) 챗봇 백엔드입니다.
+업로드된 문서를 ChromaDB에 벡터로 저장하고, 질문이 들어오면 관련 문서를 검색해 그 내용을 바탕으로 답변을 생성합니다.
 
+## 주요 기능
 
-## Getting started
+- **RAG 기반 채팅** (`/chat`): LangGraph 워크플로우로 `retrieve → generate` 단계를 구성하여, 질문과 관련된 문서를 검색한 뒤 그 내용을 근거로 답변을 생성합니다. `use_rag` 플래그로 RAG 검색을 켜고 끌 수 있습니다.
+- **문서 업로드 및 벡터 적재** (`/upload`): `.txt`, `.md`, `.pdf` 파일을 업로드하면 자동으로 텍스트를 추출하고 청크로 분할해 ChromaDB에 저장합니다. 마크다운 파일은 헤더(`#`, `##`, `###`) 단위로 분할하고, 그 외 파일은 `RecursiveCharacterTextSplitter`로 분할합니다.
+- **DB 초기화** (`/reset-db`): ChromaDB에 저장된 모든 문서를 삭제합니다.
+- **CORS 실습 API** (`/simpleparam`, `/simplejson`): Simple Request와 Preflight Request의 차이를 실습하기 위한 엔드포인트입니다.
+- **RAG 성능 평가** (`eval_ragas.py`): [Ragas](https://github.com/explodinggradients/ragas) 라이브러리로 Faithfulness, Answer Relevancy, Context Recall, Context Precision 4개 지표를 측정하고 결과를 CSV/Markdown으로 저장합니다.
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
-
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
-
-## Add your files
-
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+## 폴더 구조
 
 ```
-cd existing_repo
-git remote add origin https://lab.ssafy.com/codnrud99/trip_chatbot_gwangju_03_hyejinyu_wookyung.git
-git branch -M master
-git push -uf origin master
+servers/
+├── main.py                    # FastAPI 서버 진입점 (RAG 워크플로우, API 라우트 정의)
+├── eval_ragas.py               # Ragas를 이용한 RAG 성능 평가 스크립트
+├── requirements.txt            # Python 패키지 의존성 목록
+├── test_cases.json             # 평가용 질문/정답(ground_truth) 테스트 케이스
+├── data/                       # RAG에 사용할 원본 문서 저장 폴더 (업로드 파일도 여기 저장됨)
+│   ├── SSAFY_GUIDE.txt
+│   └── 전국관광지정보_RAG용.md
+├── chroma_data/                 # ChromaDB 벡터 저장소 (서버 종료 시 자동 삭제됨)
+├── .env                         # 환경 변수 설정 파일 (직접 생성 필요)
+└── .venv/                       # Python 가상환경
 ```
 
-## Integrate with your tools
+## 실행 방법
 
-* [Set up project integrations](https://lab.ssafy.com/codnrud99/trip_chatbot_gwangju_03_hyejinyu_wookyung/-/settings/integrations)
+### 1. 가상환경 생성 및 활성화
 
-## Collaborate with your team
+```bash
+python -m venv .venv
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+# Windows
+.venv\Scripts\activate
 
-## Test and Deploy
+# macOS / Linux
+source .venv/bin/activate
+```
 
-Use the built-in continuous integration in GitLab.
+### 2. 패키지 설치
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
+```bash
+pip install -r requirements.txt
+```
 
-***
+### 3. 환경 변수 설정
 
-# Editing this README
+프로젝트 루트에 `.env` 파일을 생성하고 아래 내용을 채웁니다.
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+```env
+API_KEY=발급받은_API_키
+base_url=사용할_API_Base_URL
+GPT_MODEL=gpt-5-mini
+EMBEDDING_MODEL=text-embedding-3-small
+```
 
-## Suggestions for a good README
+### 4. 서버 실행
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+```bash
+python main.py
+```
 
-## Name
-Choose a self-explaining name for your project.
+또는
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+```bash
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+서버가 정상적으로 실행되면 `http://localhost:8000` 에서 API를 사용할 수 있습니다.
+FastAPI 자동 문서는 `http://localhost:8000/docs` 에서 확인 가능합니다.
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+> ⚠️ 서버 종료 시 `chroma_data/` 폴더가 자동으로 삭제되도록 구성되어 있습니다 (lifespan 종료 훅). 데이터를 영구 보존하려면 `main.py`의 종료 로직을 수정하세요.
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+## API 사용 예시
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+### 채팅 요청
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+```bash
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "아트빌리지 어때?", "use_rag": true}'
+```
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+### 문서 업로드
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+```bash
+curl -X POST http://localhost:8000/upload \
+  -F "file=@./data/SSAFY_GUIDE.txt"
+```
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+### DB 초기화
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+```bash
+curl -X POST http://localhost:8000/reset-db
+```
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+## RAG 성능 평가 실행
 
-## License
-For open source projects, say how it is licensed.
+```bash
+python eval_ragas.py
+```
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+- `test_cases.json`이 있으면 해당 테스트 케이스를 사용하고, 없으면 Ragas Testset Generator로 자동 생성합니다.
+- 평가 결과는 `ragas_eval_results.csv`(전체 결과)와 `ragas_eval_history.md`(누적 기록)로 저장됩니다.
+
+## 기술 스택
+
+- **Web Framework**: FastAPI, Uvicorn
+- **RAG / LLM**: LangChain, LangGraph, OpenAI(호환 API)
+- **Vector DB**: ChromaDB
+- **평가**: Ragas
+- **문서 파싱**: PyMuPDF(PDF), TextLoader(TXT/MD)
+
+```
