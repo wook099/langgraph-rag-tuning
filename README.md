@@ -1,5 +1,5 @@
 ```
-# 광주 여행 RAG 챗봇 서버
+# 전국 여행 RAG 챗봇 서버
 
 FastAPI + LangGraph + LangChain 기반의 RAG(Retrieval-Augmented Generation) 챗봇 백엔드입니다.
 업로드된 문서를 ChromaDB에 벡터로 저장하고, 질문이 들어오면 관련 문서를 검색해 그 내용을 바탕으로 답변을 생성합니다.
