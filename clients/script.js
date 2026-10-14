@@ -1,6 +1,4 @@
-// script_v4.js - [Step 4] RAG 통합 채팅
-// 목표: /integrated-chat 엔드포인트로 변경하여 RAG 기반 답변 받기
-// 핵심 변경: URL을 /search -> /integrated-chat 로 변경! (단 한 줄!)
+// RAG 통합 채팅: /chat 호출 후 답변, 출처, 문서 사용 여부를 표시
 
 function sendMessage() {
     const inputElement = document.getElementById("user-input");
@@ -31,7 +29,11 @@ function sendMessage() {
     })
     .then(function(data) {
         // GPT가 생성한 답변 및 출처 표시
-        addMessage("bot", data.answer, data.source);
+        // RAG를 켰는데 관련 문서가 없어 일반 AI로 답한 경우 사용자에게 명시
+        const label = data.rag_used ? "출처: " + data.source
+                    : useRag ? "일반 생성형 AI 응답 (관련 문서 없음)"
+                    : null;
+        addMessage("bot", data.answer, label);
     })
     .catch(function(error) {
         console.log(error)
@@ -39,18 +41,18 @@ function sendMessage() {
     });
 }
 
-// 출처 정보도 함께 표시하도록 개선
-function addMessage(type, text, source) {
+// 출처(또는 일반 AI 응답 안내) 라벨도 함께 표시
+function addMessage(type, text, label) {
     const chatWindow = document.getElementById("chat-window");
     const messageDiv = document.createElement("div");
     messageDiv.className = "message " + type;
     messageDiv.innerText = text;
 
-    // 봇 메시지이고 출처 정보가 있으면 표시
-    if (type === "bot" && source) {
+    // 봇 메시지이고 라벨이 있으면 표시
+    if (type === "bot" && label) {
         const sourceDiv = document.createElement("div");
         sourceDiv.className = "source-tag";
-        sourceDiv.innerText = "출처: " + source;
+        sourceDiv.innerText = label;
         messageDiv.appendChild(sourceDiv);
     }
 
