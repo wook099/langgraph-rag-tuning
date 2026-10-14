@@ -1,5 +1,35 @@
+"""
+RAGAS 기반 RAG 성능 평가 및 튜닝 실험 (LangGraph 평가 파이프라인)
+
+    START → select_experiment → index → generate → ragas → record ─┬─ 남은 실험 있음 → select_experiment
+                                    (main.rag_workflow 호출)        └─ 모든 실험 완료 → compare → END
+
+    실험 설정(Top-K, Threshold, 검색 방식, 인덱스)은 전역 변수를 바꾸지 않고
+    main.rag_workflow.invoke(state, config={"configurable": {...}}) 로 실행마다 주입한다.
+
+사용법 (servers/ 폴더에서 실행):
+    python eval_ragas.py --dataset ssafy --all           # SSAFY 규정 문서 실험 전체
+    python eval_ragas.py --dataset trip --all            # 관광지 데이터 실험 전체
+    python eval_ragas.py --dataset trip --exp topk_3     # 지정한 실험만 (baseline은 항상 함께 실행)
+    python eval_ragas.py --dataset trip --all --limit 3  # 테스트 케이스 3개로 빠르게 동작 확인
+    python eval_ragas.py --dataset ssafy --list          # 실험 목록 출력
+    python eval_ragas.py --graph                         # RAG / 평가 그래프 구조(Mermaid) 출력
+
+결과:
+    eval_results/experiments_<데이터셋>.csv        실험별 설정값 + 평균 지표 (실행할 때마다 누적)
+    eval_results/experiments_<데이터셋>.md         위 CSV를 비교표로 렌더링 (Overall 최고 실험 표시)
+    eval_results/detail_<데이터셋>_<실험>.csv       질문별 답변, 검색 청크, 검색 점수, 지표
+"""
+from __future__ import annotations
+
 import os
+import argparse
+import json
+import operator
+from datetime import datetime
 from pathlib import Path
+from typing import Annotated, TypedDict
+
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -19,264 +49,358 @@ async def safe_acreate(self, *args, **kwargs):
     return await orig_acreate(self, *args, **kwargs)
 openai.resources.chat.completions.AsyncCompletions.create = safe_acreate
 
-
-# 1. 기존 main.py 모듈 및 LangChain 구성요소 로드
 import main
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langgraph.graph import StateGraph, START, END
 
-# .env 파일 로드
 load_dotenv()
 
-print("1. RAG 에이전트 인프라 초기화 중...")
-# main의 전역 설정값을 기반으로 LLM 및 임베딩 모델 수동 초기화
-main.llm = ChatOpenAI(
-    model=main.GPT_MODEL,
-    api_key=main.OPENAI_API_KEY,
-    base_url=main.BASE_URL
-)
-main.embeddings = OpenAIEmbeddings(
-    model=main.EMBEDDING_MODEL_NAME,
-    api_key=main.OPENAI_API_KEY,
-    base_url=main.BASE_URL
-)
+RESULTS_DIR = Path("./eval_results")
 
-# ChromaDB 및 템플릿 초기화 (Graph 컴파일은 몽키 패치 이후에 진행)
-main.init_vectorstore()
-main.prompt_template, main.prompt_template_general = main.init_prompt_templates()
+METRICS = ["faithfulness", "answer_relevancy", "context_recall", "context_precision"]
+UNANSWERABLE_TYPE = "문서에 없음"           # 이 유형은 RAGAS 대신 '근거 없는 답변 회피' 여부로 평가
+REFUSAL_PHRASE = "참고 문서에 나와 있지 않"  # RAG 프롬프트에 지정한 거절 문구
 
-# 평가 시작 전 가이드 문서(SSAFY_GUIDE.md)가 DB에 없다면 자동으로 적재
-print("1-2. 평가를 위한 기초 문서 데이터(SSAFY_GUIDE.md) 적재 검사...")
-try:
-    # 컬렉션 내 문서가 비어있는지 유사도 임의 검색으로 확인
-    sample_search = main.vectorstore.similarity_search("SSAFY", k=1)
-    if not sample_search:
-        print("-> DB가 비어있음을 감지했습니다. SSAFY_GUIDE.md 문서를 분할하여 적재합니다...")
-        guide_path = Path("./data/SSAFY_GUIDE.md")
-        if guide_path.exists():
-            docs = main.extract_documents(guide_path)
-            chunk_docs = main.chunk_documents(docs)
-            main.add_to_db(chunk_docs)
-            print(f"-> {len(chunk_docs)}개 청크 적재 완료.")
-        else:
-            print("🚨 경고: ./data/SSAFY_GUIDE.md 파일을 찾을 수 없습니다. 평가 결과가 정확하지 않을 수 있습니다.")
-    else:
-        print("-> DB에 기존 문서 데이터가 존재합니다. 기존 데이터를 사용하여 평가합니다.")
-except Exception as e:
-    print(f"문서 사전 적재 확인 중 예외 발생 (무시하고 계속 진행): {e}")
+# ==========================================
+# [실험 설정] 데이터셋별 baseline과 실험 정의
+# ==========================================
+# 1) SSAFY 규정 문서: 규정과 표가 연속된 문서 → 고정 길이(recursive) 분할 기준으로 Chunk/Overlap/Top-K/Threshold 비교
+SSAFY_EXPERIMENTS = {
+    "baseline":        {"hypothesis": "기준 설정 (Chunk 500 / Overlap 50 / Top-5 / Threshold 0)"},
+    "small_chunk":     {"chunk_size": 300, "overlap": 50,
+                        "hypothesis": "작은 청크는 내용이 구체적이라 Precision은 오르지만 규정이 여러 청크로 나뉘어 Recall이 떨어진다"},
+    "large_chunk":     {"chunk_size": 700, "overlap": 100,
+                        "hypothesis": "큰 청크와 넓은 겹침은 규정과 예외사항을 한 청크에 담아 Recall이 오른다"},
+    "retrieval_tuned": {"top_k": 3, "threshold": 0.15,
+                        "hypothesis": "검색 결과를 적게, 유사도 높은 것만 전달하면 노이즈가 줄어 Precision이 오른다"},
+}
 
-# 최종적으로 Graph를 빌드하여 컴파일
-main.rag_workflow = main.build_rag_graph()
-print("-> RAG 워크플로우 컴파일 완료.")
+# 2) 관광지 데이터: SSAFY 실험에서 두 변수를 동시에 바꾼 실험(large_chunk, retrieval_tuned)은 효과를 분리할 수 없었으므로
+#    가설 하나당 변수 하나만 바꾸도록 재설계
+TRIP_EXPERIMENTS = {
+    "baseline":          {"hypothesis": "기준 설정 (헤더 분할 + Vector Top-5)"},
+    # Chunk Size: 고정 길이 분할(overlap 50 고정)에서 크기에 따라 어떻게 달라지는가?
+    "recursive_300_50":  {"md_split_mode": "recursive", "chunk_size": 300, "overlap": 50,
+                          "hypothesis": "작은 청크는 한 관광지가 여러 조각으로 나뉘어 Recall이 떨어진다"},
+    "recursive_500_50":  {"md_split_mode": "recursive", "chunk_size": 500, "overlap": 50,
+                          "hypothesis": "고정 길이 분할은 관광지 경계를 무시해 헤더 분할보다 Precision이 떨어진다"},
+    "recursive_800_50":  {"md_split_mode": "recursive", "chunk_size": 800, "overlap": 50,
+                          "hypothesis": "큰 청크는 Recall은 회복되지만 여러 관광지가 섞여 Precision이 떨어진다"},
+    # Overlap: 청크 크기(500) 고정, 겹침만 변경
+    "recursive_500_0":   {"md_split_mode": "recursive", "chunk_size": 500, "overlap": 0,
+                          "hypothesis": "겹침이 없으면 경계에서 잘린 정보가 사라져 Recall이 떨어진다"},
+    "recursive_500_100": {"md_split_mode": "recursive", "chunk_size": 500, "overlap": 100,
+                          "hypothesis": "겹침을 늘리면 경계 정보가 보존되어 Recall이 오르지만 중복 청크가 늘어난다"},
+    # Top-K: 많이 가져올수록 Recall↑ Precision↓ 인가?
+    "topk_3":            {"top_k": 3, "hypothesis": "K를 줄이면 Precision은 오르고 Recall은 떨어진다"},
+    "topk_8":            {"top_k": 8, "hypothesis": "K를 늘리면 Recall은 오르고 Precision은 떨어진다"},
+    # Similarity Threshold: 관련 낮은 청크를 걸러내면 Faithfulness가 오르는가?
+    "threshold_0.2":     {"threshold": 0.2, "hypothesis": "약한 필터로 노이즈 청크만 제거되어 Precision이 오른다"},
+    "threshold_0.3":     {"threshold": 0.3, "hypothesis": "낮은 유사도 청크 제거로 Precision/Faithfulness가 오른다"},
+    "threshold_0.4":     {"threshold": 0.4, "hypothesis": "필터가 너무 강하면 필요한 청크까지 빠져 Recall이 떨어지고 Fallback이 늘어난다"},
+    # 검색 방식: 고유명사(관광지명) 질문에 키워드 검색이 도움이 되는가?
+    "hybrid":            {"retriever": "hybrid", "hypothesis": "BM25 결합으로 관광지명 질문의 Recall이 오른다"},
+}
 
+DATASETS = {
+    "ssafy": {
+        "data_file": Path("./data/SSAFY_GUIDE.md"),
+        "test_cases": Path("./test_cases_ssafy.json"),
+        "baseline": {"md_split_mode": "recursive", "chunk_size": 500, "overlap": 50,
+                     "retriever": "vector", "top_k": 5, "threshold": 0.0},
+        "experiments": SSAFY_EXPERIMENTS,
+    },
+    "trip": {
+        "data_file": Path("./data/전국관광지정보_RAG용.md"),
+        "test_cases": Path("./test_cases_trip.json"),
+        "baseline": {"md_split_mode": "header", "chunk_size": 500, "overlap": 50,   # 관광지 1개 = 청크 1개
+                     "retriever": "vector", "top_k": 5, "threshold": 0.0},
+        "experiments": TRIP_EXPERIMENTS,
+    },
+}
 
+def get_config(dataset: str, name: str) -> dict:
+    ds = DATASETS[dataset]
+    return {**ds["baseline"], **ds["experiments"][name]}
 
-import json
+# ==========================================
+# [초기화]
+# ==========================================
+def init_models():
+    """서버(lifespan)와 같은 모델·프롬프트·그래프를 준비합니다. 실험 설정은 실행할 때 RunnableConfig로 주입합니다."""
+    main.llm = ChatOpenAI(model=main.GPT_MODEL, api_key=main.OPENAI_API_KEY, base_url=main.BASE_URL)
+    main.embeddings = OpenAIEmbeddings(model=main.EMBEDDING_MODEL_NAME, api_key=main.OPENAI_API_KEY, base_url=main.BASE_URL)
+    main.prompt_template, main.prompt_template_general = main.init_prompt_templates()
+    main.rag_workflow = main.build_rag_graph()
 
-# 2. Ragas 평가용 테스트 케이스 정의 (질문 및 모범 답안)
-test_cases_file = Path("./test_cases.json")
-test_cases = []
+def to_runnable_config(cfg: dict, store) -> dict:
+    """실험 설정을 RAG 그래프 실행 인자(RunnableConfig)로 변환합니다. 전역 설정을 바꾸지 않고 실행마다 주입합니다."""
+    configurable = {key: cfg[key] for key in main.DEFAULT_RAG_CONFIG}
+    configurable["vectorstore"] = store
+    return {"configurable": configurable}
 
-if test_cases_file.exists():
-    print(f"-> 기존 생성된 테스트 케이스 파일({test_cases_file})을 로드합니다.")
-    try:
-        with open(test_cases_file, "r", encoding="utf-8") as f:
-            test_cases = json.load(f)
-    except Exception as le:
-        print(f"-> 테스트 케이스 파일 로드 중 오류 발생: {le}")
+_index_cache: dict[tuple, object] = {}   # (데이터셋, 분할 방식, Chunk, Overlap) -> 인메모리 Chroma
 
-if not test_cases:
-    print("-> 테스트 케이스 캐시가 없거나 로드에 실패했습니다. Ragas Testset Generator로 5개의 테스트 케이스를 자동 생성합니다...")
-    try:
-        from ragas.llms import LangchainLLMWrapper
-        from ragas.embeddings import LangchainEmbeddingsWrapper
-        from ragas.testset.synthesizers.generate import TestsetGenerator
+def index_key(dataset: str, cfg: dict) -> tuple:
+    return (dataset, cfg["md_split_mode"], cfg["chunk_size"], cfg["overlap"])
 
-        guide_path = Path("./data/SSAFY_GUIDE.md")
-        if guide_path.exists():
-            docs = main.extract_documents(guide_path)
-            chunk_docs = main.chunk_documents(docs)
+def build_index(dataset: str, cfg: dict) -> int:
+    """청킹 설정별로 독립된 인메모리 Chroma 컬렉션을 만들어 실험 간 데이터가 섞이지 않게 합니다.
+    청킹 설정이 같은 실험(Top-K, Threshold, Retriever만 다른 경우)은 같은 인덱스를 재사용합니다."""
+    key = index_key(dataset, cfg)
+    if key in _index_cache:
+        return _index_cache[key]._collection.count()
 
-            # Ragas 래퍼 클래스로 LLM 및 Embeddings 모델 포장
-            generator_llm = LangchainLLMWrapper(main.llm)
-            generator_embeddings = LangchainEmbeddingsWrapper(main.embeddings)
+    data_file = DATASETS[dataset]["data_file"]
+    if not data_file.exists():
+        raise FileNotFoundError(f"평가용 데이터 파일이 없습니다: {data_file}")
 
-            generator = TestsetGenerator(
-                llm=generator_llm,
-                embedding_model=generator_embeddings
-            )
-            # Ragas가 한국어로 질문과 정답을 생성하도록 프롬프트 번역 및 언어 로컬라이징 적용
-            generator.adapt_to_language("ko")
+    store = main.create_vectorstore(collection_name="eval_{}_{}_{}_{}".format(*key), persist_directory=None)
+    chunks = main.chunk_documents(main.extract_documents(data_file), chunk_size=cfg["chunk_size"],
+                                  overlap=cfg["overlap"], md_split_mode=cfg["md_split_mode"])
+    main.add_to_db(chunks, store)
+    _index_cache[key] = store
+    print(f"-> 인덱스 생성: {key} / {len(chunks)}개 청크")
+    return len(chunks)
 
+def load_test_cases(dataset: str, limit: int | None) -> list[dict]:
+    with open(DATASETS[dataset]["test_cases"], "r", encoding="utf-8") as f:
+        cases = json.load(f)
+    return cases[:limit] if limit else cases
 
-            from ragas.run_config import RunConfig
-            run_config = RunConfig(
-                max_workers=2,
-                max_retries=10,
-                timeout=180
-            )
+# ==========================================
+# [평가 단계별 함수] LangGraph 노드에서 호출
+# ==========================================
+def collect_answers(test_cases: list[dict], run_config: dict) -> list[dict]:
+    """RAG 워크플로우(main.rag_workflow)를 실험 설정(run_config)으로 질문마다 실행하고, State에 기록된 검색 결과를 수집합니다."""
+    rows = []
+    for case in test_cases:
+        state = main.rag_workflow.invoke({"question": case["question"], "use_rag": True}, config=run_config)
+        rows.append({
+            "type": case.get("type", ""),
+            "user_input": case["question"],
+            "reference": case["ground_truth"],
+            "response": state["answer"],
+            "rag_used": state.get("rag_used", False),
+            "retrieved_contexts": state.get("retrieved_contexts", []),
+            "retrieval_scores": state.get("retrieval_scores", []),
+            "retrieval_config": state.get("retrieval_config"),   # LangGraph State에 기록된 실제 적용 설정
+        })
+    return rows
 
-            print("-> LLM 기반 테스트셋 생성 중 (1~2분 정도 소요될 수 있습니다)...")
-            testset = generator.generate_with_langchain_docs(
-                documents=chunk_docs,
-                testset_size=5,
-                run_config=run_config,
-                with_debugging_logs=False
-            )
+def run_ragas(rows: list[dict]) -> list[dict]:
+    """RAGAS 4개 지표로 채점합니다. 청크를 합치지 않고 리스트 그대로 넘겨야 Context Precision이 순위별로 계산됩니다."""
+    from ragas import EvaluationDataset, evaluate
+    from ragas.metrics import Faithfulness, AnswerRelevancy, LLMContextRecall, ContextPrecision
 
-            df_testset = testset.to_pandas()
-            for _, row in df_testset.iterrows():
-                # Ragas 버전별 컬럼명 차이 대응 (question/ground_truth vs user_input/reference)
-                q = row.get("user_input") or row.get("question")
-                gt = row.get("reference") or row.get("ground_truth")
-                if q and gt:
-                    test_cases.append({
-                        "question": q,
-                        "ground_truth": gt
-                    })
+    eval_dataset = EvaluationDataset.from_list([{
+        "user_input": r["user_input"],
+        "response": r["response"],
+        "retrieved_contexts": r["retrieved_contexts"] or ["(검색된 문서 없음)"],
+        "reference": r["reference"],
+    } for r in rows])
 
-            # 생성된 테스트 케이스를 파일에 저장
-            if test_cases:
-                with open(test_cases_file, "w", encoding="utf-8") as f:
-                    json.dump(test_cases, f, ensure_ascii=False, indent=4)
-                print(f"-> {len(test_cases)}개의 테스트 케이스를 생성하여 '{test_cases_file}'에 캐싱 완료.")
-        else:
-            print("🚨 경고: ./data/SSAFY_GUIDE.md 파일이 없어 테스트셋 생성을 생략합니다.")
-    except Exception as ge:
-        print(f"🚨 Ragas Testset 생성 실패 (기본 Fallback 질문으로 대체): {ge}")
+    results = evaluate(
+        dataset=eval_dataset,
+        metrics=[Faithfulness(), AnswerRelevancy(), LLMContextRecall(), ContextPrecision()],
+        llm=main.llm,
+        embeddings=main.embeddings,
+    )
+    return results.to_pandas()[METRICS].to_dict("records")
 
-# 생성 및 캐싱 실패 시 최종 Fallback 질문 세트 지정
-if not test_cases:
-    print("-> 기본 정의된 3개의 테스트 케이스를 사용합니다.")
-    test_cases = [
-        {
-            "question": "예비군 훈련으로 결석하는 경우는 어떻게 처리되나요?",
-            "ground_truth": "공가로 처리되어 출석으로 인정되고 교육지원금도 지급됩니다. 다만 증빙 문서를 반드시 제출해야 합니다."
-        },
-        {
-            "question": "교육 명찰을 분실하면 어떻게 해야 하고 비용은 얼마인가요?",
-            "ground_truth": "교육 명찰을 분실하면 즉시 신고하고 분실 사유서 작성 후 재발급받아야 하며, 재발급 비용 약 16,500원은 본인이 부담합니다. 재발급 기간에는 임시 명찰을 패용합니다."
-        },
-        {
-            "question": "정규 교육 시간과 점심 시간은 각각 몇 시부터 몇 시까지인가요?",
-            "ground_truth": "정규 교육 시간은 평일 09:00 ~ 18:00 이며, 중식 시간은 12:00 ~ 13:00 입니다. 토요일, 일요일 및 공휴일은 미운영합니다."
-        }
-    ]
+# ==========================================
+# [LangGraph 평가 파이프라인]
+# ==========================================
+class EvalState(TypedDict, total=False):
+    dataset: str                     # ssafy | trip
+    test_cases: list[dict]           # 평가 질문/정답
+    queue: list[str]                 # 아직 실행하지 않은 실험 이름
+    experiment: str                  # 현재 실험 이름
+    config: dict                     # 현재 실험의 Chunk Size / Overlap / Top-K / Threshold / 검색 방식
+    n_chunks: int                    # 현재 설정으로 만든 청크 수
+    rows: list[dict]                 # 질문별 답변 + 검색 결과
+    scores: list[dict]               # 질문별 RAGAS 점수 (답이 문서에 있는 질문만)
+    summaries: Annotated[list[dict], operator.add]   # 실험별 요약 (실험이 끝날 때마다 누적)
+    best: dict                       # Overall 최고 실험
 
+def select_experiment_node(state: EvalState) -> EvalState:
+    """[1] 큐에서 다음 실험을 꺼내 설정을 결정합니다. (전역 설정은 건드리지 않음)"""
+    name, *rest = state["queue"]
+    cfg = get_config(state["dataset"], name)
+    print(f"\n==================== [{state['dataset']} / {name}] {cfg['hypothesis']} ====================")
+    return {"experiment": name, "config": cfg, "queue": rest}
 
-# 3. RAG 시스템을 호출하여 평가에 필요한 데이터(답변, 검색된 컨텍스트) 수집
-print("\n2. 테스트 케이스에 대한 RAG 응답 수집 중...")
-eval_data = []
+def index_node(state: EvalState) -> EvalState:
+    """[2] 현재 실험의 Chunk Size / Overlap으로 독립 인덱스를 준비합니다."""
+    return {"n_chunks": build_index(state["dataset"], state["config"])}
 
-for case in test_cases:
-    question = case["question"]
-    ground_truth = case["ground_truth"]
+def generate_node(state: EvalState) -> EvalState:
+    """[3] 현재 실험의 Top-K / Threshold / 검색 방식과 인덱스를 RunnableConfig로 주입해 RAG 그래프로 답변을 생성합니다."""
+    store = _index_cache[index_key(state["dataset"], state["config"])]
+    return {"rows": collect_answers(state["test_cases"], to_runnable_config(state["config"], store))}
 
-    print(f"질문 수행 중: {question}")
-    # RAG 워크플로우 직접 실행
-    initial_state = {
-        "question": question,
-        "use_rag": True,
-        "context": "",
-        "source": ""
+def ragas_node(state: EvalState) -> EvalState:
+    """[4] 답이 문서에 있는 질문을 RAGAS로 채점합니다. ('문서에 없음' 유형은 record 단계에서 따로 평가)"""
+    answerable = [r for r in state["rows"] if r["type"] != UNANSWERABLE_TYPE]
+    return {"scores": run_ragas(answerable)}
+
+def record_node(state: EvalState) -> EvalState:
+    """[5] 질문별 상세 결과와 실험 요약을 저장합니다. (실험마다 저장하여 중간에 실패해도 앞선 결과 유지)"""
+    dataset, name, cfg, rows = state["dataset"], state["experiment"], state["config"], state["rows"]
+    answerable = [r for r in rows if r["type"] != UNANSWERABLE_TYPE]
+    unanswerable = [r for r in rows if r["type"] == UNANSWERABLE_TYPE]
+    df_scores = pd.DataFrame(state["scores"], columns=METRICS)
+
+    # 근거 없는 답변 회피율: 문서에 없는 질문에 지어내지 않고 거절했거나 일반 AI 응답임을 표시했는가
+    handled = [(not r["rag_used"]) or (REFUSAL_PHRASE in r["response"]) for r in unanswerable]
+
+    detail = pd.DataFrame(rows)
+    for metric in METRICS:
+        detail[metric] = None
+        detail.loc[detail["type"] != UNANSWERABLE_TYPE, metric] = df_scores[metric].values
+    RESULTS_DIR.mkdir(exist_ok=True)
+    detail.to_csv(RESULTS_DIR / f"detail_{dataset}_{name}.csv", index=False, encoding="utf-8-sig")
+
+    averages = {metric: round(float(df_scores[metric].mean()), 4) for metric in METRICS}
+    summary = {
+        "run_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "dataset": dataset,
+        "experiment": name,
+        "hypothesis": cfg["hypothesis"],
+        "md_split_mode": cfg["md_split_mode"],
+        "chunk_size": cfg["chunk_size"] if cfg["md_split_mode"] == "recursive" else "-",
+        "overlap": cfg["overlap"] if cfg["md_split_mode"] == "recursive" else "-",
+        "retriever": cfg["retriever"],
+        "top_k": cfg["top_k"],
+        "threshold": cfg["threshold"],
+        "n_chunks": state["n_chunks"],
+        "n_cases": len(answerable),
+        **averages,
+        "overall": round(sum(averages.values()) / len(averages), 4),
+        "rag_used_rate": round(sum(r["rag_used"] for r in answerable) / max(len(answerable), 1), 4),
+        "unanswerable_handled": f"{sum(handled)}/{len(handled)}" if handled else "-",
+        "judge_model": main.GPT_MODEL,
     }
-    final_state = main.rag_workflow.invoke(initial_state)
+    print(pd.Series(summary).to_string())
+    save_summary(dataset, [summary])
+    return {"summaries": [summary]}
 
-    # RAG가 찾아온 원본 문장 리스트 확보
-    retrieved_contexts = [final_state["context"]] if final_state["context"] else []
+def route_next(state: EvalState) -> str:
+    """남은 실험이 있으면 다음 실험으로, 없으면 최종 비교로 이동"""
+    return "select_experiment" if state["queue"] else "compare"
 
-    eval_data.append({
-        "user_input": question,
-        "response": final_state["answer"],
-        "retrieved_contexts": retrieved_contexts,
-        "reference": ground_truth
-    })
+def compare_node(state: EvalState) -> EvalState:
+    """[6] 이번 실행의 실험들을 Overall 기준으로 정렬하고 baseline 대비 개선율을 계산합니다."""
+    ranked = sorted(state["summaries"], key=lambda r: r["overall"], reverse=True)
+    baseline = next((r for r in state["summaries"] if r["experiment"] == "baseline"), None)
+    print("\n==================== 실험 비교 (Overall 순) ====================")
+    for r in ranked:
+        diff = f"{(r['overall'] - baseline['overall']) / baseline['overall'] * 100:+.1f}%" if baseline else "-"
+        print(f"{r['experiment']:20s} overall={r['overall']:.4f}  baseline 대비 {diff}")
+    return {"best": ranked[0]}
 
-# 4. Ragas EvaluationDataset 구축 및 평가 실행
-print("\n3. Ragas 평가 시작 (LLM 심사 구동)...")
-from ragas import EvaluationDataset, evaluate
-from ragas.metrics import Faithfulness, AnswerRelevancy, LLMContextRecall, ContextPrecision
+def build_eval_graph():
+    """
+    START → select_experiment → index → generate → ragas → record ─┬─ 남은 실험 있음 → select_experiment
+                                           (main.rag_workflow 호출)  └─ 모든 실험 완료 → compare → END
+    """
+    graph = StateGraph(EvalState)
+    graph.add_node("select_experiment", select_experiment_node)
+    graph.add_node("index", index_node)
+    graph.add_node("generate", generate_node)
+    graph.add_node("ragas", ragas_node)
+    graph.add_node("record", record_node)
+    graph.add_node("compare", compare_node)
 
-# Ragas 0.4 규격에 맞게 데이터셋 로드
-dataset = EvaluationDataset.from_list(eval_data)
+    graph.add_edge(START, "select_experiment")
+    graph.add_edge("select_experiment", "index")
+    graph.add_edge("index", "generate")
+    graph.add_edge("generate", "ragas")
+    graph.add_edge("ragas", "record")
+    graph.add_conditional_edges("record", route_next, {"select_experiment": "select_experiment", "compare": "compare"})
+    graph.add_edge("compare", END)
+    return graph.compile()
 
-# 평가에 사용할 지표 구성 (4대 지표)
-metrics = [
-    Faithfulness(llm=main.llm),
-    AnswerRelevancy(llm=main.llm),
-    LLMContextRecall(llm=main.llm),
-    ContextPrecision(llm=main.llm)
-]
+# ==========================================
+# [결과 저장] CSV 누적 + 비교표 Markdown 생성
+# ==========================================
+def save_summary(dataset: str, summaries: list[dict]):
+    RESULTS_DIR.mkdir(exist_ok=True)
+    summary_csv = RESULTS_DIR / f"experiments_{dataset}.csv"
+    summary_md = RESULTS_DIR / f"experiments_{dataset}.md"
+    df_new = pd.DataFrame(summaries)
+    if summary_csv.exists():
+        df_all = pd.concat([pd.read_csv(summary_csv), df_new], ignore_index=True)
+    else:
+        df_all = df_new
+    df_all.to_csv(summary_csv, index=False, encoding="utf-8-sig")
 
-# Ragas 평가 실행
-results = evaluate(
-    dataset=dataset,
-    metrics=metrics,
-    llm=main.llm,
-    embeddings=main.embeddings
-)
+    # 실험별 최신 결과만 비교표로 렌더링
+    order = {name: i for i, name in enumerate(DATASETS[dataset]["experiments"])}
+    latest = (df_all.drop_duplicates("experiment", keep="last")
+              .sort_values("experiment", key=lambda col: col.map(order))
+              .reset_index(drop=True))
+    best = latest["overall"].idxmax()
+    baseline_overall = latest.loc[latest["experiment"] == "baseline", "overall"]
 
-# 5. 결과 시각화 및 저장
-print("\n================ Ragas 평가 결과 ================")
-print(results)
-print("=================================================")
+    lines = [
+        f"# RAG 튜닝 실험 결과 ({dataset})",
+        "",
+        f"`python eval_ragas.py --dataset {dataset} --all` 실행 결과에서 자동 생성된 파일입니다. (실험별 최신 실행 기준)",
+        "",
+        "| 실험 | 분할 | Chunk/Overlap | 검색 | Top-K | Threshold | Faithfulness | Answer Relevancy | Context Recall | Context Precision | **Overall** | Baseline 대비 | 문서 없음 질문 처리 |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for i, r in latest.iterrows():
+        diff = f"{(r['overall'] - baseline_overall.iloc[0]) / baseline_overall.iloc[0] * 100:+.1f}%" if len(baseline_overall) else "-"
+        overall = f"**{r['overall']:.4f}** ⭐" if i == best else f"{r['overall']:.4f}"
+        lines.append(
+            f"| {r['experiment']} | {r['md_split_mode']} | {r['chunk_size']}/{r['overlap']} | {r['retriever']} | {r['top_k']} | {r['threshold']} "
+            f"| {r['faithfulness']:.4f} | {r['answer_relevancy']:.4f} | {r['context_recall']:.4f} | {r['context_precision']:.4f} "
+            f"| {overall} | {diff} | {r['unanswerable_handled']} |"
+        )
+    lines += ["", "## 실험 가설", ""]
+    lines += [f"- **{r['experiment']}**: {r['hypothesis']}" for _, r in latest.iterrows()]
+    summary_md.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"\n-> '{summary_csv}' 누적 저장, '{summary_md}' 비교표 갱신 완료")
 
-# 판다스 데이터프레임으로 변환하여 상세 결과 출력 및 CSV/MD 저장
-df_results = results.to_pandas()
-print("\n[상세 리포트]")
-print(df_results[["user_input", "faithfulness", "answer_relevancy", "context_recall", "context_precision"]])
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="RAGAS 기반 RAG 튜닝 실험")
+    parser.add_argument("--dataset", choices=list(DATASETS), default="trip", help="평가할 문서와 테스트셋")
+    parser.add_argument("--exp", nargs="+", default=["baseline"], help="실행할 실험 이름 (--list로 확인)")
+    parser.add_argument("--all", action="store_true", help="해당 데이터셋의 모든 실험 실행")
+    parser.add_argument("--limit", type=int, help="테스트 케이스 수 제한 (동작 확인용)")
+    parser.add_argument("--list", action="store_true", help="실험 목록 출력")
+    parser.add_argument("--graph", action="store_true", help="RAG / 평가 LangGraph 구조를 Mermaid로 출력")
+    args = parser.parse_args()
+    experiments = DATASETS[args.dataset]["experiments"]
 
-# CSV 저장 (기존 코드 유지)
-output_csv = "ragas_eval_results.csv"
-df_results.to_csv(output_csv, index=False, encoding="utf-8-sig")
-print(f"\n평가 상세 결과가 '{output_csv}' 파일로 저장되었습니다.")
+    if args.list:
+        for name in experiments:
+            cfg = get_config(args.dataset, name)
+            print(f"{name:20s} chunk={cfg['chunk_size']}/{cfg['overlap']} ({cfg['md_split_mode']}) "
+                  f"top_k={cfg['top_k']} threshold={cfg['threshold']} {cfg['retriever']:6s} | {cfg['hypothesis']}")
+        raise SystemExit
 
-# MD 저장 (누적 추가)
-from datetime import datetime
-now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-output_md = "ragas_eval_history.md"
+    if args.graph:
+        print("%% RAG 워크플로우 (main.py)\n" + main.build_rag_graph().get_graph().draw_mermaid())
+        print("%% 평가 파이프라인 (eval_ragas.py)\n" + build_eval_graph().get_graph().draw_mermaid())
+        raise SystemExit
 
-# 평균값 계산
-avg_faithfulness = df_results["faithfulness"].mean()
-avg_relevancy = df_results["answer_relevancy"].mean()
-avg_recall = df_results["context_recall"].mean()
-avg_precision = df_results["context_precision"].mean()
+    unknown = [name for name in args.exp if name not in experiments]
+    if unknown:
+        parser.error(f"'{args.dataset}' 데이터셋에 없는 실험: {unknown} (사용 가능: {list(experiments)})")
 
-# 마크다운 내용 구성
-md_content = f"""
-## 📊 RAG 성능 평가 결과 (실행 시각: {now_str})
+    names = list(experiments) if args.all else args.exp
+    if "baseline" not in names:
+        names = ["baseline"] + names  # 비교 기준이 항상 같은 실행에 포함되도록
 
-### 1. 평균 점수 요약
-| Faithfulness (충실도) | Answer Relevancy (관련성) | Context Recall (재현율) | Context Precision (정밀도) |
-| :---: | :---: | :---: | :---: |
-| {avg_faithfulness:.4f} | {avg_relevancy:.4f} | {avg_recall:.4f} | {avg_precision:.4f} |
+    init_models()
+    test_cases = load_test_cases(args.dataset, args.limit)
+    print(f"[{args.dataset}] 테스트 케이스 {len(test_cases)}개 / 실험 {names}")
 
-### 2. 상세 질문별 리포트
-| 질문 (user_input) | Faithfulness | Answer Relevancy | Context Recall | Context Precision |
-| :--- | :---: | :---: | :---: | :---: |
-"""
-
-for _, row in df_results.iterrows():
-    # Ragas 평가지표 중 None이나 NaN 값이 있을 수 있으므로 안전하게 처리
-    f_val = row.get("faithfulness", 0.0)
-    r_val = row.get("answer_relevancy", 0.0)
-    rc_val = row.get("context_recall", 0.0)
-    p_val = row.get("context_precision", 0.0)
-
-    f_str = f"{f_val:.4f}" if pd.notna(f_val) else "N/A"
-    r_str = f"{r_val:.4f}" if pd.notna(r_val) else "N/A"
-    rc_str = f"{rc_val:.4f}" if pd.notna(rc_val) else "N/A"
-    p_str = f"{p_val:.4f}" if pd.notna(p_val) else "N/A"
-
-    md_content += f"| {row['user_input']} | {f_str} | {r_str} | {rc_str} | {p_str} |\n"
-
-md_content += "\n---\n"
-
-# 파일에 누적(Append)하여 쓰기
-file_exists = os.path.exists(output_md)
-with open(output_md, "a", encoding="utf-8") as f:
-    if not file_exists:
-        f.write("# 📈 Ragas RAG 성능 평가 누적 기록\n\n")
-    f.write(md_content)
-
-print(f"평가 결과가 누적 기록 파일 '{output_md}'에 추가되었습니다.")
-
+    final = build_eval_graph().invoke(
+        {"dataset": args.dataset, "test_cases": test_cases, "queue": names, "summaries": []},
+        config={"recursion_limit": 6 * len(names) + 10},   # 실험 1개 = 노드 5개 순환
+    )
+    print(f"\n-> 최고 실험: {final['best']['experiment']} (Overall {final['best']['overall']:.4f})")
