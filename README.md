@@ -39,14 +39,13 @@ flowchart LR
 ```
 ① 문제의식   RAG 성능은 LLM만으로 결정되지 않는다. 문서를 어떻게 자르고 몇 개를 가져오느냐가 답변을 바꾼다
 ② 가설       Chunk Size · Overlap · Top-K · Threshold가 검색 품질을 좌우할 것이다
-③ 실험 1     SSAFY 규정 문서, 테스트 케이스 10개로 설정 4가지 비교
+③ 실험       SSAFY 규정 문서, 테스트 케이스 10개로 설정 4가지 비교
 ④ 발견       큰 청크가 가장 좋았고, 검색 결과를 줄이는 튜닝은 오히려 손해였다
              설계 문제도 발견: 변수 2개 동시 변경, L2 점수의 Threshold, 청크를 합쳐 평가
 ⑤ 개선       평가를 LangGraph 그래프로 재구성하고, 코사인 유사도와 청크 리스트 평가로 수정
-⑥ 실험 2     관광지 데이터에서 변수 하나씩만 바꾸도록 재설계 (실행 예정)
 ```
 
-## 실험 1: SSAFY 교육 규정
+## 실험: SSAFY 교육 규정
 
 SSAFY 가이드를 설정별로 청킹·임베딩해 저장하고, 테스트 케이스 10개(질문 + 정답)로 검색과 답변을 시험한 뒤 RAGAS로 채점한 평균입니다.
 
@@ -69,19 +68,6 @@ SSAFY 가이드를 설정별로 청킹·임베딩해 저장하고, 테스트 케
 - 테스트 케이스가 10개라 작은 차이는 우연일 수 있다. 경향을 확인한 수준이다.
 - large_chunk와 retrieval_tuned는 변수 두 개를 동시에 바꿨다.
 - 현재 코드로 정리하기 전 버전(L2 점수, 청크를 합쳐 평가)에서 측정했다.
-
-## 실험 2: 전국 관광지 (설계)
-
-실험 1의 한계를 반영해 **각 실험이 비교 기준과 변수 하나만 다르도록** 설계했습니다. 테스트 케이스는 14개이며, 그중 "문서에 없음" 2개는 근거 없는 답변을 지어내지 않았는지로 따로 평가합니다.
-
-| 변수 | 실험 | 비교 기준 |
-| --- | --- | --- |
-| 분할 방식 | `recursive_500_50` (헤더 분할 → 500자 분할) | `baseline` |
-| Chunk Size | `recursive_300_50`, `recursive_800_50` | `recursive_500_50` |
-| Overlap | `recursive_500_0`, `recursive_500_100` | `recursive_500_50` |
-| Top-K | `topk_3`, `topk_8` | `baseline` |
-| Threshold | `threshold_0.2`, `threshold_0.3`, `threshold_0.4` | `baseline` |
-| 검색 방식 | `hybrid` | `baseline` |
 
 설계 배경과 문제 해결 과정은 [docs/RAG_정리_보완.md](docs/RAG_정리_보완.md)에 정리했습니다.
 
@@ -121,9 +107,8 @@ curl -X POST http://localhost:8000/upload -F "file=@./data/SSAFY_GUIDE.md" \
 **평가**
 
 ```bash
-python eval_ragas.py --dataset ssafy --all    # 실험 1
-python eval_ragas.py --dataset trip --all     # 실험 2
-python eval_ragas.py --dataset trip --list    # 실험 목록과 비교 기준
+python eval_ragas.py --dataset ssafy --all    # 실험 실행
+python eval_ragas.py --dataset ssafy --list   # 실험 목록과 설정값
 python eval_ragas.py --graph                  # 그래프 구조(Mermaid) 출력
 ```
 
