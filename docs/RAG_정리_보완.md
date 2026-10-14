@@ -298,7 +298,7 @@ if not vector_hits:
 | | |
 | --- | --- |
 | **문제** | 설정값이 코드에 하드코딩되어 있었고, 결과 파일에는 점수만 남고 **어떤 설정으로 얻은 점수인지** 남지 않았다. 같은 DB를 계속 써서 이전 실험 청크가 섞일 위험도 있었다. |
-| **해결 1** | 실험을 코드로 정의: 가설 하나당 변수 하나만 baseline에서 변경 |
+| **해결 1** | 실험을 코드로 정의: 각 실험이 비교 기준(`compare_to`)과 변수 하나만 다르도록 하고, 비교 기준 실험은 자동으로 함께 실행 |
 | **해결 2** | 청킹 설정별로 **독립된 인메모리 Chroma 컬렉션** 생성. 청킹이 같은 실험(Top-K, Threshold, 검색 방식만 다름)은 인덱스를 재사용해 임베딩 비용 절감 |
 | **해결 3** | 설정값 + 4개 지표 + Overall + 회피율을 `experiments_<데이터셋>.csv`에 누적하고, 비교표 `experiments_<데이터셋>.md` 자동 생성 (Baseline 대비 증감, 최고 실험 표시) |
 | **해결 4** | 검색할 때마다 적용된 Top-K / Threshold / 검색 방식과, 검색된 청크의 청킹 설정을 LangGraph State의 `retrieval_config`에 기록하여 질문별 결과에도 함께 저장. 청킹 설정은 인덱싱 시점에 청크 메타데이터로 남기고 검색 시 그 값을 읽어, 실제와 다른 값이 기록되지 않도록 함 |
@@ -394,22 +394,23 @@ python eval_ragas.py --dataset ssafy --all
 
 ### 8-3. 실험 2: 전국 관광지 데이터
 
-실험 1의 한계를 반영하여 **baseline에서 변수 하나만 바꾸도록** 설계하였다. 관광지 데이터는 헤더 분할이 기본이므로, Chunk Size와 Overlap은 고정 길이 분할로 바꿔 비교한다.
+실험 1의 한계를 반영하여 **각 실험이 비교 기준(`compare_to`)과 변수 하나만 다르도록** 설계하였다.
+관광지 데이터는 헤더 분할이 기본이라 Chunk Size와 Overlap이 적용되지 않는다. 그래서 먼저 `recursive_500_50`으로 분할 방식만 바꿔 baseline과 비교하고, Chunk Size와 Overlap은 `recursive_500_50`을 기준으로 비교한다. baseline과 직접 비교하면 분할 방식과 Chunk Size가 동시에 바뀌기 때문이다.
 
-| 실험 | 변수 | 가설 |
-| --- | --- | --- |
-| `baseline` | - | 헤더 분할 + Vector Top-5 + Threshold 0 |
-| `recursive_300_50` | Chunk Size | 작은 청크는 한 관광지가 여러 조각으로 나뉘어 Recall이 떨어진다 |
-| `recursive_500_50` | Chunk Size | 고정 길이 분할은 관광지 경계를 무시해 헤더 분할보다 Precision이 떨어진다 |
-| `recursive_800_50` | Chunk Size | 큰 청크는 Recall은 회복되지만 여러 관광지가 섞여 Precision이 떨어진다 |
-| `recursive_500_0` | Overlap | 겹침이 없으면 경계에서 잘린 정보가 사라져 Recall이 떨어진다 |
-| `recursive_500_100` | Overlap | 겹침을 늘리면 경계 정보가 보존되지만 중복 청크가 늘어난다 |
-| `topk_3` | Top-K | K를 줄이면 Precision↑ Recall↓ |
-| `topk_8` | Top-K | K를 늘리면 Recall↑ Precision↓ |
-| `threshold_0.2` | Threshold | 약한 필터로 노이즈 청크만 제거되어 Precision이 오른다 |
-| `threshold_0.3` | Threshold | 낮은 유사도 청크 제거로 Precision과 Faithfulness가 오른다 |
-| `threshold_0.4` | Threshold | 필터가 너무 강하면 필요한 청크까지 빠져 Recall이 떨어지고 Fallback이 늘어난다 |
-| `hybrid` | 검색 방식 | BM25 결합으로 관광지명 질문의 Recall이 오른다 |
+| 실험 | 변수 | 비교 기준 | 가설 |
+| --- | --- | --- | --- |
+| `baseline` | - | - | 헤더 분할 + Vector Top-5 + Threshold 0 |
+| `recursive_500_50` | 분할 방식 | baseline | 고정 길이 분할은 관광지 경계를 무시해 헤더 분할보다 Precision이 떨어진다 |
+| `recursive_300_50` | Chunk Size | recursive_500_50 | 작은 청크는 한 관광지가 여러 조각으로 나뉘어 Recall이 떨어진다 |
+| `recursive_800_50` | Chunk Size | recursive_500_50 | 큰 청크는 Recall은 회복되지만 여러 관광지가 섞여 Precision이 떨어진다 |
+| `recursive_500_0` | Overlap | recursive_500_50 | 겹침이 없으면 경계에서 잘린 정보가 사라져 Recall이 떨어진다 |
+| `recursive_500_100` | Overlap | recursive_500_50 | 겹침을 늘리면 경계 정보가 보존되지만 중복 청크가 늘어난다 |
+| `topk_3` | Top-K | baseline | K를 줄이면 Precision↑ Recall↓ |
+| `topk_8` | Top-K | baseline | K를 늘리면 Recall↑ Precision↓ |
+| `threshold_0.2` | Threshold | baseline | 약한 필터로 노이즈 청크만 제거되어 Precision이 오른다 |
+| `threshold_0.3` | Threshold | baseline | 낮은 유사도 청크 제거로 Precision과 Faithfulness가 오른다 |
+| `threshold_0.4` | Threshold | baseline | 필터가 너무 강하면 필요한 청크까지 빠져 Recall이 떨어지고 Fallback이 늘어난다 |
+| `hybrid` | 검색 방식 | baseline | BM25 결합으로 관광지명 질문의 Recall이 오른다 |
 
 ```bash
 cd servers

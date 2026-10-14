@@ -10,7 +10,7 @@ RAGAS 기반 RAG 성능 평가 및 튜닝 실험 (LangGraph 평가 파이프라�
 사용법 (servers/ 폴더에서 실행):
     python eval_ragas.py --dataset ssafy --all           # SSAFY 규정 문서 실험 전체
     python eval_ragas.py --dataset trip --all            # 관광지 데이터 실험 전체
-    python eval_ragas.py --dataset trip --exp topk_3     # 지정한 실험만 (baseline은 항상 함께 실행)
+    python eval_ragas.py --dataset trip --exp topk_3     # 지정한 실험만 (비교 기준 실험은 자동으로 함께 실행)
     python eval_ragas.py --dataset trip --all --limit 3  # 테스트 케이스 3개로 빠르게 동작 확인
     python eval_ragas.py --dataset ssafy --list          # 실험 목록 출력
     python eval_ragas.py --graph                         # RAG / 평가 그래프 구조(Mermaid) 출력
@@ -76,20 +76,23 @@ SSAFY_EXPERIMENTS = {
 }
 
 # 2) 관광지 데이터: SSAFY 실험에서 두 변수를 동시에 바꾼 실험(large_chunk, retrieval_tuned)은 효과를 분리할 수 없었으므로
-#    가설 하나당 변수 하나만 바꾸도록 재설계
+#    각 실험이 비교 기준(compare_to)과 변수 하나만 다르도록 재설계
+#    - Chunk Size / Overlap 실험은 고정 길이 분할끼리 비교해야 하므로 recursive_500_50이 기준
+#    - recursive_500_50은 baseline(헤더 분할)과 분할 방식만 다름
 TRIP_EXPERIMENTS = {
     "baseline":          {"hypothesis": "기준 설정 (헤더 분할 + Vector Top-5)"},
     # Chunk Size: 고정 길이 분할(overlap 50 고정)에서 크기에 따라 어떻게 달라지는가?
-    "recursive_300_50":  {"md_split_mode": "recursive", "chunk_size": 300, "overlap": 50,
-                          "hypothesis": "작은 청크는 한 관광지가 여러 조각으로 나뉘어 Recall이 떨어진다"},
+    # 분할 방식: 헤더 분할 vs 고정 길이 분할
     "recursive_500_50":  {"md_split_mode": "recursive", "chunk_size": 500, "overlap": 50,
                           "hypothesis": "고정 길이 분할은 관광지 경계를 무시해 헤더 분할보다 Precision이 떨어진다"},
-    "recursive_800_50":  {"md_split_mode": "recursive", "chunk_size": 800, "overlap": 50,
+    "recursive_300_50":  {"md_split_mode": "recursive", "chunk_size": 300, "overlap": 50, "compare_to": "recursive_500_50",
+                          "hypothesis": "작은 청크는 한 관광지가 여러 조각으로 나뉘어 Recall이 떨어진다"},
+    "recursive_800_50":  {"md_split_mode": "recursive", "chunk_size": 800, "overlap": 50, "compare_to": "recursive_500_50",
                           "hypothesis": "큰 청크는 Recall은 회복되지만 여러 관광지가 섞여 Precision이 떨어진다"},
     # Overlap: 청크 크기(500) 고정, 겹침만 변경
-    "recursive_500_0":   {"md_split_mode": "recursive", "chunk_size": 500, "overlap": 0,
+    "recursive_500_0":   {"md_split_mode": "recursive", "chunk_size": 500, "overlap": 0, "compare_to": "recursive_500_50",
                           "hypothesis": "겹침이 없으면 경계에서 잘린 정보가 사라져 Recall이 떨어진다"},
-    "recursive_500_100": {"md_split_mode": "recursive", "chunk_size": 500, "overlap": 100,
+    "recursive_500_100": {"md_split_mode": "recursive", "chunk_size": 500, "overlap": 100, "compare_to": "recursive_500_50",
                           "hypothesis": "겹침을 늘리면 경계 정보가 보존되어 Recall이 오르지만 중복 청크가 늘어난다"},
     # Top-K: 많이 가져올수록 Recall↑ Precision↓ 인가?
     "topk_3":            {"top_k": 3, "hypothesis": "K를 줄이면 Precision은 오르고 Recall은 떨어진다"},
@@ -121,7 +124,24 @@ DATASETS = {
 
 def get_config(dataset: str, name: str) -> dict:
     ds = DATASETS[dataset]
-    return {**ds["baseline"], **ds["experiments"][name]}
+    default_ref = None if name == "baseline" else "baseline"
+    return {"compare_to": default_ref, **ds["baseline"], **ds["experiments"][name]}
+
+def with_references(dataset: str, names: list[str]) -> list[str]:
+    """비교 기준 실험이 같은 실행에 포함되도록 기준을 앞에 추가합니다."""
+    ordered: list[str] = []
+    def add(name):
+        ref = get_config(dataset, name)["compare_to"]
+        if ref:
+            add(ref)
+        if name not in ordered:
+            ordered.append(name)
+    for name in names:
+        add(name)
+    return ordered
+
+def relative_diff(value: float, ref_value: float | None) -> str:
+    return f"{(value - ref_value) / ref_value * 100:+.1f}%" if ref_value else "-"
 
 # ==========================================
 # [초기화]
@@ -267,6 +287,7 @@ def record_node(state: EvalState) -> EvalState:
         "dataset": dataset,
         "experiment": name,
         "hypothesis": cfg["hypothesis"],
+        "compare_to": cfg["compare_to"] or "-",
         "md_split_mode": cfg["md_split_mode"],
         "chunk_size": cfg["chunk_size"] if cfg["md_split_mode"] == "recursive" else "-",
         "overlap": cfg["overlap"] if cfg["md_split_mode"] == "recursive" else "-",
@@ -290,13 +311,14 @@ def route_next(state: EvalState) -> str:
     return "select_experiment" if state["queue"] else "compare"
 
 def compare_node(state: EvalState) -> EvalState:
-    """[6] 이번 실행의 실험들을 Overall 기준으로 정렬하고 baseline 대비 개선율을 계산합니다."""
+    """[6] 이번 실행의 실험들을 Overall 기준으로 정렬하고, 각 실험의 비교 기준(compare_to) 대비 증감을 계산합니다."""
     ranked = sorted(state["summaries"], key=lambda r: r["overall"], reverse=True)
-    baseline = next((r for r in state["summaries"] if r["experiment"] == "baseline"), None)
+    overall_by_name = {r["experiment"]: r["overall"] for r in state["summaries"]}
     print("\n==================== 실험 비교 (Overall 순) ====================")
     for r in ranked:
-        diff = f"{(r['overall'] - baseline['overall']) / baseline['overall'] * 100:+.1f}%" if baseline else "-"
-        print(f"{r['experiment']:20s} overall={r['overall']:.4f}  baseline 대비 {diff}")
+        ref = r["compare_to"]
+        diff = relative_diff(r["overall"], overall_by_name.get(ref))
+        print(f"{r['experiment']:20s} overall={r['overall']:.4f}  기준({ref}) 대비 {diff}")
     return {"best": ranked[0]}
 
 def build_eval_graph():
@@ -341,23 +363,23 @@ def save_summary(dataset: str, summaries: list[dict]):
               .sort_values("experiment", key=lambda col: col.map(order))
               .reset_index(drop=True))
     best = latest["overall"].idxmax()
-    baseline_overall = latest.loc[latest["experiment"] == "baseline", "overall"]
+    overall_by_name = dict(zip(latest["experiment"], latest["overall"]))
 
     lines = [
         f"# RAG 튜닝 실험 결과 ({dataset})",
         "",
         f"`python eval_ragas.py --dataset {dataset} --all` 실행 결과에서 자동 생성된 파일입니다. (실험별 최신 실행 기준)",
         "",
-        "| 실험 | 분할 | Chunk/Overlap | 검색 | Top-K | Threshold | Faithfulness | Answer Relevancy | Context Recall | Context Precision | **Overall** | Baseline 대비 | 문서 없음 질문 처리 |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| 실험 | 분할 | Chunk/Overlap | 검색 | Top-K | Threshold | Faithfulness | Answer Relevancy | Context Recall | Context Precision | **Overall** | 비교 기준 | 기준 대비 | 문서 없음 질문 처리 |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for i, r in latest.iterrows():
-        diff = f"{(r['overall'] - baseline_overall.iloc[0]) / baseline_overall.iloc[0] * 100:+.1f}%" if len(baseline_overall) else "-"
+        diff = relative_diff(r["overall"], overall_by_name.get(r["compare_to"]))
         overall = f"**{r['overall']:.4f}** ⭐" if i == best else f"{r['overall']:.4f}"
         lines.append(
             f"| {r['experiment']} | {r['md_split_mode']} | {r['chunk_size']}/{r['overlap']} | {r['retriever']} | {r['top_k']} | {r['threshold']} "
             f"| {r['faithfulness']:.4f} | {r['answer_relevancy']:.4f} | {r['context_recall']:.4f} | {r['context_precision']:.4f} "
-            f"| {overall} | {diff} | {r['unanswerable_handled']} |"
+            f"| {overall} | {r['compare_to']} | {diff} | {r['unanswerable_handled']} |"
         )
     lines += ["", "## 실험 가설", ""]
     lines += [f"- **{r['experiment']}**: {r['hypothesis']}" for _, r in latest.iterrows()]
@@ -379,7 +401,8 @@ if __name__ == "__main__":
         for name in experiments:
             cfg = get_config(args.dataset, name)
             print(f"{name:20s} chunk={cfg['chunk_size']}/{cfg['overlap']} ({cfg['md_split_mode']}) "
-                  f"top_k={cfg['top_k']} threshold={cfg['threshold']} {cfg['retriever']:6s} | {cfg['hypothesis']}")
+                  f"top_k={cfg['top_k']} threshold={cfg['threshold']} {cfg['retriever']:6s} "
+                  f"vs {cfg['compare_to'] or '-':17s} | {cfg['hypothesis']}")
         raise SystemExit
 
     if args.graph:
@@ -392,8 +415,7 @@ if __name__ == "__main__":
         parser.error(f"'{args.dataset}' 데이터셋에 없는 실험: {unknown} (사용 가능: {list(experiments)})")
 
     names = list(experiments) if args.all else args.exp
-    if "baseline" not in names:
-        names = ["baseline"] + names  # 비교 기준이 항상 같은 실행에 포함되도록
+    names = with_references(args.dataset, names)  # 각 실험의 비교 기준이 같은 실행에 포함되도록
 
     init_models()
     test_cases = load_test_cases(args.dataset, args.limit)
