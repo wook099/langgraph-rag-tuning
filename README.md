@@ -7,8 +7,10 @@ FastAPI + LangGraph + LangChain 기반의 RAG(Retrieval-Augmented Generation) �
 
 | 데이터 | 특징 | 청킹 전략 |
 | --- | --- | --- |
-| **SSAFY 교육생 가이드** (`SSAFY_GUIDE.md`) | 출결·보안·장학 등 규정과 표가 연속된 문서 | 글자 수 기준 분할 (Chunk/Overlap 튜닝) |
+| **SSAFY 교육생 가이드** (`SSAFY_GUIDE.md`) | 출결·보안·장학 등 규정과 표가 연속된 문서 | 글자 수 기준 분할로 Chunk/Overlap 튜닝 (실험 최고: 700/100) |
 | **전국 관광지 정보** (`전국관광지정보_RAG용.md`) | 공공데이터 CSV를 변환한 관광지 735곳 레코드 | 헤더 기준 분할 (관광지 1곳 = 청크 1개) |
+
+> 서버의 `.md` 기본 분할 방식은 헤더 분할입니다. SSAFY 가이드처럼 글자 수 분할이 맞는 문서는 업로드할 때 청킹 방식을 지정합니다 ([문서 업로드](#문서-업로드)).
 
 ## 주요 기능
 
@@ -16,7 +18,7 @@ FastAPI + LangGraph + LangChain 기반의 RAG(Retrieval-Augmented Generation) �
   - `use_rag` 플래그로 RAG 검색을 켜고 끌 수 있습니다.
   - 유사도 Threshold를 통과한 문서가 없으면 일반 생성형 AI로 Fallback하고, 화면에 "일반 생성형 AI 응답 (관련 문서 없음)"을 표시합니다.
   - 검색 방식은 `vector`(의미 검색) 또는 `hybrid`(의미 검색 + BM25 키워드 검색, RRF 결합) 중 선택합니다.
-- **문서 업로드 및 벡터 적재** (`/upload`): `.txt`, `.md`, `.pdf` 파일을 업로드하면 자동으로 텍스트를 추출하고 청크로 분할해 ChromaDB에 저장합니다. 마크다운 파일은 헤더(`#`, `##`, `###`) 단위로 분할하고(관광지 1곳 = 청크 1개), 그 외 파일은 `RecursiveCharacterTextSplitter`로 분할합니다. (`MD_SPLIT_MODE=recursive`로 바꾸면 마크다운도 글자 수 기준으로 분할)
+- **문서 업로드 및 벡터 적재** (`/upload`): `.txt`, `.md`, `.pdf` 파일을 업로드하면 자동으로 텍스트를 추출하고 청크로 분할해 ChromaDB에 저장합니다. 마크다운 파일은 기본적으로 헤더(`#`, `##`, `###`) 단위로 분할하고, 그 외 파일은 `RecursiveCharacterTextSplitter`로 분할합니다. 업로드할 때 `split_mode` / `chunk_size` / `overlap`을 지정해 실험에서 찾은 청킹 설정을 문서별로 적용할 수 있으며, 적용된 청킹 설정은 각 청크의 메타데이터에 기록됩니다.
 - **DB 초기화** (`/reset-db`): ChromaDB에 저장된 모든 문서를 삭제합니다.
 - **CORS 실습 API** (`/simpleparam`, `/simplejson`): Simple Request와 Preflight Request의 차이를 실습하기 위한 엔드포인트입니다.
 - **RAG 성능 평가 및 튜닝 실험** (`eval_ragas.py`): [Ragas](https://github.com/explodinggradients/ragas) 라이브러리로 Faithfulness, Answer Relevancy, Context Recall, Context Precision 4개 지표를 측정합니다. 데이터셋별로 Chunk Size, Overlap, Top-K, Similarity Threshold, 검색 방식을 바꾼 실험을 한 번에 실행하고 비교표를 생성합니다.
@@ -44,8 +46,8 @@ State에는 답변 외에도 다음 값을 저장하여 RAGAS 평가에 그대�
 | --- | --- |
 | `rag_used` | 실제로 검색 문서를 근거로 답했는지 |
 | `retrieved_contexts` | LLM에 전달된 청크 목록 (프롬프트 Context와 RAGAS 평가에 공통 사용) |
-| `retrieval_scores` | 각 청크의 유사도 점수 |
-| `retrieval_config` | 그 답변을 만들 때 적용된 Chunk Size / Overlap / Top-K / Threshold / 검색 방식 |
+| `retrieval_scores` | 각 청크의 검색 점수 (vector: 코사인 유사도, hybrid: RRF 점수) |
+| `retrieval_config` | 그 답변에 적용된 Top-K / Threshold / 검색 방식, 그리고 검색된 청크의 청킹 설정(분할 방식 / Chunk Size / Overlap — 청크 메타데이터에서 읽음) |
 
 ### 2. 평가·튜닝 파이프라인 (`eval_ragas.py` `build_eval_graph`)
 
@@ -54,7 +56,7 @@ Chunk Size, Overlap, Top-K, Similarity Threshold 실험을 하나의 그래프�
 ```mermaid
 flowchart TD
     S([START]) --> A[select_experiment<br/>다음 실험과 설정 결정]
-    A --> B[index<br/>설정 적용 + 청킹별 독립 인덱스]
+    A --> B[index<br/>청킹 설정별 독립 인덱스 준비]
     B --> C[generate<br/>RAG 답변 파이프라인으로 답변 생성]
     C --> D[ragas<br/>Faithfulness · Answer Relevancy<br/>Context Recall · Context Precision]
     D --> F[record<br/>질문별 결과 + 실험 요약 저장]
@@ -183,9 +185,17 @@ curl -X POST http://localhost:8000/chat \
 ### 문서 업로드
 
 ```bash
+# 관광지 데이터: 기본 설정 (헤더 분할, 관광지 1곳 = 청크 1개)
 curl -X POST http://localhost:8000/upload \
   -F "file=@./data/전국관광지정보_RAG용.md"
+
+# SSAFY 가이드: 실험 1에서 가장 좋았던 청킹 설정(글자 수 분할 700 / 100) 적용
+curl -X POST http://localhost:8000/upload \
+  -F "file=@./data/SSAFY_GUIDE.md" \
+  -F "split_mode=recursive" -F "chunk_size=700" -F "overlap=100"
 ```
+
+응답의 `chunking`에 실제 적용된 청킹 설정이 표시됩니다. 웹 UI의 **문서 추가** 버튼은 기본 설정으로 업로드합니다.
 
 ### DB 초기화
 
@@ -241,6 +251,8 @@ python eval_ragas.py --dataset trip --all --limit 3  # 질문 3개로 빠르게 
 
 **결과**
 
+> 이 결과는 현재 평가 그래프로 정리하기 **이전 버전의 파이프라인**에서 측정했습니다. 당시에는 Chroma 기본(L2) 점수를 사용했고, 검색 청크를 하나의 문자열로 합쳐 RAGAS에 전달했습니다. 현재 코드(코사인 유사도, 청크 리스트 전달)로 `--dataset ssafy --all`을 다시 실행하면 값이 달라질 수 있습니다.
+
 | 실험 | Faithfulness | Answer Relevancy | Context Recall | Context Precision | **Overall** |
 | --- | --- | --- | --- | --- | --- |
 | baseline (500/50) | **0.9900** | **0.5411** | 0.9000 | 0.6672 | 0.7746 |
@@ -259,6 +271,7 @@ python eval_ragas.py --dataset trip --all --limit 3  # 질문 3개로 빠르게 
 
 - `large_chunk`(Chunk + Overlap), `retrieval_tuned`(Top-K + Threshold)는 **두 변수를 동시에 바꿔** 개별 효과를 분리할 수 없었다. → 실험 2에서 변수를 하나씩 바꾸도록 재설계했다.
 - 당시 Threshold 0.15는 Chroma 기본(L2) 거리에서 변환한 점수 기준이라 값의 의미가 불분명했다. L2 기반 점수는 음수가 될 수 있다. → 코사인 유사도로 통일했다.
+- 검색 청크를 하나로 합쳐 평가에 전달해 Context Precision이 청크 순위를 반영하지 못했다. → 청크 리스트를 그대로 전달하도록 수정했다.
 - 10문항, 1회 측정이라 LLM 채점의 편차는 확인하지 못했다.
 
 ### 실험 2: 전국 관광지 데이터
@@ -279,17 +292,19 @@ python eval_ragas.py --dataset trip --all --limit 3  # 질문 3개로 빠르게 
 | `threshold_0.2` / `threshold_0.3` / `threshold_0.4` | Similarity Threshold | 노이즈 청크 제거로 Precision↑, 너무 높으면 필요한 청크까지 빠져 Recall↓ |
 | `hybrid` | 검색 방식 | BM25 결합으로 관광지명(고유명사) 질문의 Recall↑ |
 
-### 평가를 통해 개선한 점
+### 구현 과정에서 발견한 문제와 개선
 
 | 문제 | 원인 | 개선 |
 | --- | --- | --- |
-| 고정 길이 청킹이 관광지 경계를 깸 | 레코드 길이가 1자~1,574자로 제각각 | `##` 헤더 단위 분할 (관광지 1곳 = 청크 1개) |
+| 고정 길이 청킹이 관광지 경계를 깸 | 관광지 레코드 길이가 330~1,047자로 제각각이라 고정 길이(500자)와 경계가 맞지 않음 | `##` 헤더 단위 분할 (관광지 1곳 = 청크 1개) |
 | Threshold가 의도대로 동작하지 않음 | Chroma 기본 L2 거리의 relevance score는 음수가 될 수 있음 | 컬렉션을 코사인 공간으로 생성해 점수 = 코사인 유사도로 통일 |
 | 관련 문서가 없어도 RAG 답변 | 그래프에 검색 결과 분기가 없음 | LangGraph 2단계 분기 + 일반 AI Fallback + 화면 표시 |
 | 관광지명 질문에 의미 검색이 약함 | 임베딩은 정확한 문자열 일치를 보장하지 않음 | BM25(단어 + bigram 토큰화) + Vector를 RRF로 결합 |
 | Hybrid 모드에서 Fallback이 안 됨 | BM25는 관련 없는 질문에도 항상 결과 반환 | 관련 문서 존재 여부는 Vector Threshold로만 판단 |
 | Context Precision이 왜곡됨 | 청크를 문자열 하나로 합쳐 평가에 전달 | 청크 리스트를 그대로 전달 |
 | 실험 재현 불가 | 설정 하드코딩, 결과에 설정값 미기록 | 설정 `.env` 분리, 실험 정의 코드화, 설정과 지표를 함께 누적 기록 |
+| 튜닝 결과가 서비스에 반영되지 않음 | 서버는 모든 `.md`를 헤더 분할로 처리 | 업로드 시 문서별 청킹 설정 지정, 적용값을 청크 메타데이터에 기록 |
+| 기록된 청킹 설정이 실제와 다를 수 있음 | 현재 기본값을 기록 (인덱싱 당시 값이 아님) | `retrieval_config.chunking`을 검색된 청크의 메타데이터에서 읽음 |
 
 자세한 설계와 문제 해결 과정은 [docs/RAG_정리_보완.md](docs/RAG_정리_보완.md)에 정리했습니다.
 

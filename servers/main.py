@@ -12,7 +12,7 @@ if "HF_HOME" not in os.environ and "TRANSFORMERS_CACHE" not in os.environ:
 import shutil
 from pathlib import Path
 from contextlib import asynccontextmanager
-from typing import TypedDict
+from typing import Optional, TypedDict
 
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -90,7 +90,8 @@ class RAGState(TypedDict, total=False):
     rag_used: bool                  # 실제로 검색 문서를 근거로 답변했는지 (관련 문서가 없으면 False)
     retrieved_contexts: list[str]   # Threshold를 통과해 LLM에 전달된 청크 목록 (프롬프트 Context, RAGAS 평가에 공통 사용)
     retrieval_scores: list[float]   # 각 청크의 검색 점수 (vector: 코사인 유사도, hybrid: RRF 점수)
-    retrieval_config: dict          # 이 답변을 만들 때 적용된 Chunk Size / Overlap / Top-K / Threshold / 검색 방식
+    retrieval_config: dict          # 이 답변에 실제 적용된 검색 설정(Top-K / Threshold / 검색 방식)과
+                                    # 검색된 청크의 청킹 설정(분할 방식 / Chunk Size / Overlap, 청크 메타데이터에서 읽음)
 
 # ==========================================
 # [검색기] Vector / BM25 / Hybrid
@@ -152,7 +153,14 @@ def retrieve_node(state: RAGState, config: RunnableConfig) -> RAGState:
     search = hybrid_search if rag_config["retriever"] == "hybrid" else vector_search
     docs_with_scores = search(rag_config["vectorstore"], state["question"], rag_config["top_k"], rag_config["threshold"])
 
-    applied = {key: rag_config[key] for key in DEFAULT_RAG_CONFIG}   # vectorstore 객체는 기록에서 제외
+    docs = [doc for doc, _ in docs_with_scores]
+    applied = {
+        "retriever": rag_config["retriever"],
+        "top_k": rag_config["top_k"],
+        "threshold": rag_config["threshold"],
+        # 청킹은 인덱싱 시점에 결정되므로, 현재 설정값이 아니라 검색된 청크에 기록된 값을 사용
+        "chunking": [dict(c) for c in sorted({tuple(sorted(chunking_metadata(doc).items())) for doc in docs})],
+    }
 
     # 터미널 디버그용 출력 (점수 정보 추가)
     print(f"\n--- [RAG 검색 결과] {applied} ---")
@@ -161,7 +169,6 @@ def retrieve_node(state: RAGState, config: RunnableConfig) -> RAGState:
         print(f"   내용: {doc.page_content.strip()[:80]}...")
     print("----------------------------\n")
 
-    docs = [doc for doc, _ in docs_with_scores]
     return {
         "source": ", ".join(sorted({doc.metadata.get("source", "알 수 없음") for doc in docs})),
         "rag_used": bool(docs),
@@ -240,6 +247,12 @@ def extract_documents(file_path: Path) -> list[Document]:
         print(f"문서 추출 오류: {e}")
     return []
 
+CHUNKING_KEYS = ("split_mode", "chunk_size", "chunk_overlap")
+
+def chunking_metadata(doc: Document) -> dict:
+    """청크 메타데이터에 기록된 청킹 설정을 꺼냅니다."""
+    return {key: doc.metadata[key] for key in CHUNKING_KEYS if key in doc.metadata}
+
 def chunk_documents(documents: list[Document], chunk_size: int | None = None, overlap: int | None = None,
                     md_split_mode: str | None = None) -> list[Document]:
     """마크다운 파일은 헤더 기준으로 통째 청킹하고(md_split_mode=header), 그 외 문서는 RecursiveSplitter 사용
@@ -280,11 +293,14 @@ def chunk_documents(documents: list[Document], chunk_size: int | None = None, ov
                 # 기존 문서의 metadata(filename 등)를 분할된 청크에도 복사/병합합니다.
                 new_metadata = doc.metadata.copy()
                 new_metadata.update(chunk.metadata)  # 헤더 정보도 메타데이터에 담김
+                new_metadata["split_mode"] = "header"   # 헤더 분할은 Chunk Size / Overlap을 사용하지 않음
                 split_docs.append(Document(page_content=chunk.page_content, metadata=new_metadata))
 
         # 2. PDF나 일반 TXT 파일(또는 recursive 모드의 .md)인 경우: RecursiveCharacterTextSplitter 사용
         else:
-            split_docs.extend(text_splitter.split_documents([doc]))
+            for chunk in text_splitter.split_documents([doc]):
+                chunk.metadata.update({"split_mode": "recursive", "chunk_size": chunk_size, "chunk_overlap": overlap})
+                split_docs.append(chunk)
 
     return split_docs
 
@@ -450,7 +466,14 @@ def chat(req: ChatReq):
 # [API 2] 파일 업로드 (동적 문서 추가)
 # ==========================================
 @app.post("/upload")
-def upload_file(file: UploadFile = File(...)):
+def upload_file(
+    file: UploadFile = File(...),
+    split_mode: Optional[str] = Form(None),   # (선택) header | recursive, 생략 시 .env 기본값
+    chunk_size: Optional[int] = Form(None),   # (선택) recursive 분할 시 청크 크기
+    overlap: Optional[int] = Form(None),      # (선택) recursive 분할 시 겹침
+):
+    """문서를 업로드해 청킹·임베딩 후 저장합니다. 실험에서 찾은 청킹 설정을 문서별로 지정할 수 있습니다.
+    예) SSAFY 가이드에 실험 최고 설정 적용: -F split_mode=recursive -F chunk_size=700 -F overlap=100"""
     allowed_extensions = {".txt", ".md", ".pdf"}
     file_ext = Path(file.filename).suffix.lower()
     if file_ext not in allowed_extensions:
@@ -458,6 +481,8 @@ def upload_file(file: UploadFile = File(...)):
             "success": False,
             "message": f"지원하지 않는 파일 형식입니다. ({', '.join(allowed_extensions)} 만 허용)"
         }
+    if split_mode not in (None, "header", "recursive"):
+        return {"success": False, "message": "split_mode는 header 또는 recursive만 가능합니다."}
     try:
         # 파일을 data 폴더에 백업 저장
         save_path = DATA_DIR / file.filename
@@ -470,12 +495,13 @@ def upload_file(file: UploadFile = File(...)):
            return {"success": False, "message": "파일 내용이 없거나 읽을 수 없습니다."}
 
         # Document 청킹 및 DB 벡터 적재
-        chunk_docs = chunk_documents(docs)
+        chunk_docs = chunk_documents(docs, chunk_size=chunk_size, overlap=overlap, md_split_mode=split_mode)
         chunks_added = add_to_db(chunk_docs)
         return {
             "success": True,
             "message": f"'{file.filename}' 업로드 완료! ({chunks_added}개 청크 추가)",
-            "chunks_added": chunks_added
+            "chunks_added": chunks_added,
+            "chunking": chunking_metadata(chunk_docs[0]) if chunk_docs else None,
         }
     except Exception as e:
         return {"success": False, "message": f"파일 처리 중 오류 발생: {str(e)}"}
