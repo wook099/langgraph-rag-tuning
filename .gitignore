@@ -3,3 +3,7 @@ servers/.venv/
 __pycache__/
 *.pyc
 .env
+
+# ChromaDB 런타임 저장소 (서버 종료 시 자동 삭제)
+servers/chroma_data/
+chroma_data/
